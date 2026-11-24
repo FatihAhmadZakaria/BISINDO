@@ -3,17 +3,16 @@ import {
   FilesetResolver,
 } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
-// 3 tulang jari (tanpa koneksi ke titik 0 / Wrist)
-const FINGER_3BONE_CONNECTIONS = [
-  [1, 2], [2, 3], [3, 4],
-  [5, 6], [6, 7], [7, 8],
-  [9, 10], [10, 11], [11, 12],
-  [13, 14], [14, 15], [15, 16],
-  [17, 18], [18, 19], [19, 20],
+// Khusus Tulang Falang Murni (Ibu jari 2 tulang: 2->3->4, 4 jari lainnya 3 tulang, tanpa titik 0 & 1)
+const PHALANX_CONNECTIONS = [
+  [2, 3], [3, 4],               // Ibu jari: 2 tulang falang (Proximal & Distal)
+  [5, 6], [6, 7], [7, 8],       // Telunjuk: 3 tulang falang
+  [9, 10], [10, 11], [11, 12],  // Tengah: 3 tulang falang
+  [13, 14], [14, 15], [15, 16], // Manis: 3 tulang falang
+  [17, 18], [18, 19], [19, 20], // Kelingking: 3 tulang falang
 ];
 
-const FINGER_CHAINS = [
-  [4, 3, 2, 1],
+const OTHER_4_FINGERS_CHAINS = [
   [8, 7, 6, 5],
   [12, 11, 10, 9],
   [16, 15, 14, 13],
@@ -132,7 +131,7 @@ guideModal.addEventListener("click", (e) => {
   if (e.target === guideModal) closeGuideModal();
 });
 
-// 4. Load MediaPipe & Exported 3-Bone Finger Model JSON (100% Client-Side for Vercel)
+// 4. Load MediaPipe & Exported Phalanx-Only Model JSON (100% Client-Side for Vercel)
 async function initModels() {
   try {
     const [modelRes, vision] = await Promise.all([
@@ -159,10 +158,11 @@ async function initModels() {
   }
 }
 
-// 5. Client-Side 3-Bone Feature Extraction & MLP Forward Pass (Identical to Python train_finger_landmarks.py)
-function extractSingleHandFeatures(landmarks) {
+// 5. Client-Side Phalanx-Only Feature Extraction (19 points: 2..20, 14 phalanx bones = 122 features/hand)
+function extractSingleHandPhalanxFeatures(landmarks) {
   const pts = landmarks.map((lm) => [lm.x, lm.y, lm.z || 0.0]);
-  const mcpIndices = [1, 5, 9, 13, 17];
+  // Titik pusat referensi: rata-rata dari sendi pangkal falang ke-5 jari (2, 5, 9, 13, 17)
+  const mcpIndices = [2, 5, 9, 13, 17];
   const mcpCenter = [0, 0, 0];
   mcpIndices.forEach((idx) => {
     mcpCenter[0] += pts[idx][0] / 5;
@@ -170,10 +170,10 @@ function extractSingleHandFeatures(landmarks) {
     mcpCenter[2] += pts[idx][2] / 5;
   });
 
-  // 20 titik jari (indeks 1..20, tanpa Wrist 0)
+  // 19 titik falang (indeks 2..20, tanpa titik 0 Wrist & tanpa titik 1 Thumb CMC)
   const centered = [];
   let maxNorm2D = 1e-6;
-  for (let i = 1; i <= 20; i++) {
+  for (let i = 2; i <= 20; i++) {
     const cx = pts[i][0] - mcpCenter[0];
     const cy = pts[i][1] - mcpCenter[1];
     const cz = pts[i][2] - mcpCenter[2];
@@ -191,7 +191,28 @@ function extractSingleHandFeatures(landmarks) {
   const boneFeatures = [];
   const angleFeatures = [];
 
-  FINGER_CHAINS.forEach(([tip, j1, j2, base]) => {
+  // 1. Ibu Jari: Hanya 2 tulang falang (4->3 Distal Phalanx, 3->2 Proximal Phalanx)
+  const tb1 = [
+    (pts[4][0] - pts[3][0]) / scale,
+    (pts[4][1] - pts[3][1]) / scale,
+    (pts[4][2] - pts[3][2]) / scale,
+  ];
+  const tb2 = [
+    (pts[3][0] - pts[2][0]) / scale,
+    (pts[3][1] - pts[2][1]) / scale,
+    (pts[3][2] - pts[2][2]) / scale,
+  ];
+  [tb1, tb2].forEach((b) => {
+    const len = Math.hypot(b[0], b[1], b[2]);
+    boneFeatures.push(b[0], b[1], b[2], len);
+  });
+  const tna = Math.hypot(tb1[0], tb1[1], tb1[2]) + 1e-6;
+  const tnb = Math.hypot(tb2[0], tb2[1], tb2[2]) + 1e-6;
+  const tdot = tb1[0] * tb2[0] + tb1[1] * tb2[1] + tb1[2] * tb2[2];
+  angleFeatures.push(Math.max(-1.0, Math.min(1.0, tdot / (tna * tnb))));
+
+  // 2. Empat jari lainnya: masing-masing 3 tulang falang
+  OTHER_4_FINGERS_CHAINS.forEach(([tip, j1, j2, base]) => {
     const b1 = [
       (pts[tip][0] - pts[j1][0]) / scale,
       (pts[tip][1] - pts[j1][1]) / scale,
@@ -225,29 +246,30 @@ function extractSingleHandFeatures(landmarks) {
     });
   });
 
-  return [...normCoords, ...boneFeatures, ...angleFeatures]; // 130 features
+  return [...normCoords, ...boneFeatures, ...angleFeatures]; // 122 features per hand
 }
 
 function predictClientSide(handsLandmarks) {
   if (!fingerModelData || !handsLandmarks || handsLandmarks.length === 0) return;
 
+  // Urutkan tangan dari kiri ke kanan berdasarkan rata-rata X titik falang (2..20)
   const handsSorted = [...handsLandmarks].sort((a, b) => {
     let meanA = 0,
       meanB = 0;
-    for (let i = 1; i <= 20; i++) {
+    for (let i = 2; i <= 20; i++) {
       meanA += a[i].x;
       meanB += b[i].x;
     }
     return meanA - meanB;
   });
 
-  const featH1 = extractSingleHandFeatures(handsSorted[0]);
-  let featH2 = new Array(130).fill(0);
+  const featH1 = extractSingleHandPhalanxFeatures(handsSorted[0]);
+  let featH2 = new Array(122).fill(0);
   let interTipDists = new Array(25).fill(0);
   let handCountFlag = 1.0;
 
   if (handsSorted.length > 1) {
-    featH2 = extractSingleHandFeatures(handsSorted[1]);
+    featH2 = extractSingleHandPhalanxFeatures(handsSorted[1]);
     const tips = [4, 8, 12, 16, 20];
     interTipDists = [];
     tips.forEach((t1) => {
@@ -260,7 +282,7 @@ function predictClientSide(handsLandmarks) {
     handCountFlag = 2.0;
   }
 
-  const rawFeat = [...featH1, ...featH2, ...interTipDists, handCountFlag];
+  const rawFeat = [...featH1, ...featH2, ...interTipDists, handCountFlag]; // Total 270 features
 
   // StandardScaler transform
   const mean = fingerModelData.scaler_mean;
@@ -386,7 +408,8 @@ function drawHands(results, width, height, isMirrored) {
       };
     });
 
-    const activePoints = points.slice(1);
+    // Hanya gambar 19 titik falang (indeks 2..20, tanpa titik 0 Wrist & tanpa titik 1 CMC)
+    const activePoints = points.slice(2);
     const xs = activePoints.map((p) => p.x);
     const ys = activePoints.map((p) => p.y);
     const pad = 16;
@@ -401,7 +424,7 @@ function drawHands(results, width, height, isMirrored) {
 
     ctx.strokeStyle = "#22c55e";
     ctx.lineWidth = 2;
-    FINGER_3BONE_CONNECTIONS.forEach(([start, end]) => {
+    PHALANX_CONNECTIONS.forEach(([start, end]) => {
       ctx.beginPath();
       ctx.moveTo(points[start].x, points[start].y);
       ctx.lineTo(points[end].x, points[end].y);
